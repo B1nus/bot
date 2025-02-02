@@ -1,0 +1,47 @@
+.{
+    // This is the default name used by packages depending on this one. For
+    // example, when a user runs `zig fetch --save <url>`, this field is used
+    // as the key in the `dependencies` table. Although the user can choose a
+    // different name, most users will stick with this provided value.
+    //
+    // It is redundant to include "zig" in this name because it is already
+    // within the Zig package namespace.
+    .name = "bot",
+
+    // This is a [Semantic Version](https://semver.org/).
+    // In a future version of Zig it will be used for package deduplication.
+    .version = "0.0.0",
+
+    // This field is optional.
+    // This is currently advisory only; Zig does not yet do anything
+    // with this value.
+    //.minimum_zig_version = "0.11.0",
+
+    // This field is optional.
+    // Each dependency must either provide a `url` and `hash`, or a `path`.
+    // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
+    // Once all dependencies are fetched, `zig build` no longer requires
+    // internet connectivity.
+    .dependencies = .{
+        .zigimg = .{
+            .url = "https://github.com/zigimg/zigimg/archive/bbf48e7.tar.gz",
+            .hash = "1220234151ce3dfb0ae960956aa7ea0cf898020d3f1fb2235b85a5cff7cd3a4c8452",
+        },
+        .@"raylib-zig" = .{
+            .url = "git+https://github.com/Not-Nik/raylib-zig?ref=devel#58724227e7fd90bebfcbd44c6013231447a67ff2",
+            .hash = "1220eedbc450fcfced1599d69f1e2c38b60af51616dbf724f6b9a8ed2c2a7c62cf9c",
+        },
+        .@"ollama-zig" = .{
+            .url = "git+https://github.com/dravenk/ollama-zig.git#7cb0deaa743156dd6e27ee7b36908778bc39dd91",
+            .hash = "1220d4dd376a2d9ed644201363f39bd165e873a60dcf1d45e2fa3e4714142eae57c0",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        // For example...
+        //"LICENSE",
+        //"README.md",
+    },
+}
