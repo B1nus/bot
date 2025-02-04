@@ -1,4 +1,4 @@
+models/
 zig-out/
 .zig-cache/
-*.gguf
-*.tga
+vm.py

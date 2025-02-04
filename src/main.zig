@@ -1,151 +1,238 @@
 const std = @import("std");
 const assert = std.debug.assert;
-const print = std.debug.print;
-const Endian = std.builtin.Endian;
 const Timer = std.time.Timer;
-const c = @cImport({
-    @cInclude("tesseract/capi.h");
-});
-const raylib = @import("raylib");
+const ollama = @import("ollama.zig");
+const vnc = @import("vnc.zig");
+const c = @cImport(@cInclude("tesseract/capi.h"));
 
-const ollama_template = "You are roleplaying as a linux user. You can write commands like this <command ls\\n>. Use backspace \\\"\\b\\\" to erase what you just wrote <command \\b\\b\\b>.";
-const prompt_template = "This is what you see on the linux machine:\\n<eye>{s}</eye>\\n";
-const parent_model = "llama3";
-const model_name = "bot";
-const ollama_host = "127.0.0.1";
-const ollama_port = 11434;
+const ollama_brain_model = "dolphin-mistral";
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
+    const stdout = std.io.getStdOut().writer();
 
-    var ollama_stream = try std.net.tcpConnectToHost(allocator, ollama_host, ollama_port);
+    var ollama_buffer: [4096 * 8]u8 = undefined;
+    const ollama_stream = try std.net.tcpConnectToAddress(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 11434));
+    try ollama.send_request(allocator, &ollama_buffer, ollama_stream, "create", .{
+        .model = "bot",
+        .from = ollama_brain_model,
+        .system = "You are a linux user and you write commands like this <write>ls\\n</write>. You have the username and password \"bot\"",
+        // \\You speak like this <speak>I am listing the files</speak>.
+        // \\You only offer short responses. About one sentence each.
+        // \\The <eye> tags are mine and you are not allowed to use them ):<
+        // \\You can erase a mistake with backspace <write>\b</write>
+        // \\You can speak by using <speak>I'm going to write some python now</speak>
+        .stream = false,
+    });
 
-    try create_model(&ollama_stream, allocator, parent_model, ollama_template);
-    print("Successfully created model \"{s}\"\n", .{model_name});
-
-    var response_buffer: [2048]u8 = undefined;
-    const prompt = try std.fmt.allocPrint(allocator, prompt_template, .{"Joe mama! HAHAHA gottem."});
-    defer allocator.free(prompt);
-    try ollama_start_token_stream(&ollama_stream, allocator, &response_buffer, try std.fmt.allocPrint(allocator, prompt_template, .{"Joe mama! HAHAHA gottem."}));
-    print("Succesfully started new token stream with prompt: \"{s}\"\n", .{prompt});
-
-    while (try ollama_next_token(&ollama_stream, allocator, &response_buffer)) |token| {
-        print("{s}", .{token});
-    }
-    print("\n", .{});
-
-    var args = std.process.args();
-    _ = args.skip();
-    const port = 5900 + try std.fmt.parseInt(u16, args.next().?[1..], 10);
-
-    var stream, const width, const height, const bits_per_pixel = try vnc_handshake("127.0.0.1", port, "RFB 003.008\n", true);
-    defer stream.close();
-    print("Sucessfully connected to vnc server at 127.0.0.1:{d}\n", .{port});
-
-    raylib.initWindow(@intCast(width), @intCast(height), "bot");
+    const vnc_stream, const width, const height, const bits_per_pixel = try vnc.handshake(.{ 127, 0, 0, 1 }, 5900, true);
 
     const bytes_per_pixel = @divExact(bits_per_pixel, 8);
     const pixels: []u8 = try allocator.alloc(u8, width * height * bytes_per_pixel);
-    defer allocator.free(pixels);
-
-    var text: ?[*:0]u8 = null;
-
     var pixels_mutex = std.Thread.Mutex{};
+
+    var text: []u8 = "";
+    // var prev: []u8 = "";
     var text_mutex = std.Thread.Mutex{};
-    _ = try std.Thread.spawn(.{}, screen_loop, .{ &stream, pixels, &pixels_mutex, width, height, bytes_per_pixel });
+
+    _ = try std.Thread.spawn(.{}, screen_loop, .{ vnc_stream, pixels, &pixels_mutex, width, height, bytes_per_pixel });
     _ = try std.Thread.spawn(.{}, image_to_text_loop, .{ pixels, &pixels_mutex, width, height, bytes_per_pixel, &text, &text_mutex });
-    print("Successfully started pixels thread and text thread\n", .{});
 
-    while (!raylib.windowShouldClose()) {
-        text_mutex.lock();
-        if (text) |s| {
-            print("{s}\n", .{s});
+    const State = enum {
+        waiting,
+        thought,
+        keyboard_start_tag,
+        keyboard_end_tag,
+        keyboard,
+        keyboard_backslash,
+    };
+    var tok_start: usize = 0;
+    var tok_i: usize = 0;
+    var state: State = .waiting;
+    var prompt = try std.ArrayList(u8).initCapacity(allocator, 1_000_000);
+    var written = try std.ArrayList(u8).initCapacity(allocator, 1_000);
+
+    var wait_timer = try Timer.start();
+    const wait_time = 5_000_000_000;
+
+    // const diff_min = 10;
+    const write_start = "<write>";
+    const write_end = "</write>";
+    const eye_start = "<eye>";
+    const eye_end = "</eye>";
+
+    while (true) {
+        // text_mutex.lock();
+        // const diff = text_difference(text, prev);
+        //if (diff > diff_min or
+        if (state == .waiting and wait_timer.read() > wait_time) {
+            // if (state != .waiting) {
+            //     // Skip rest of response
+            //     while (try ollama.read_response(ollama_stream.reader(), &ollama_buffer, allocator)) |_| {}
+            //
+            //     // Finish their tags
+            //     //
+            //     // TODO: Check if this actually works.
+            //     switch (state) {
+            //         .keyboard, .keyboard_backslash => try prompt.writer().print(write_end, .{}),
+            //         .keyboard_end_tag => try prompt.writer().print("{s}", .{write_end[tok_i - tok_start ..]}),
+            //         .keyboard_start_tag => try prompt.writer().print("{s}{s}", .{ write_start[tok_i - tok_start ..], write_end }),
+            //         .thought => {},
+            //         .waiting => unreachable,
+            //     }
+            //
+            //     // try prompt.writer().print("</bot>", .{});
+            // }
+
+            text_mutex.lock();
+            try prompt.writer().print("\x1b[1m{s}{s}{s}\x1b[0m", .{ eye_start, text, eye_end });
+            text_mutex.unlock();
+
+            try ollama.send_request(allocator, &ollama_buffer, ollama_stream, "generate", .{
+                .model = "bot",
+                .prompt = prompt.items,
+                .stream = true,
+            });
+
+            tok_i = prompt.items.len;
+            tok_start = tok_i;
+
+            state = .thought;
         }
-        text_mutex.unlock();
+        // prev = try allocator.alloc(u8, text.len);
+        // std.mem.copyForwards(u8, prev, text);
+        // text_mutex.unlock();
 
-        pixels_mutex.lock();
-        const image = raylib.Image{
-            .data = pixels.ptr,
-            .width = @intCast(width),
-            .height = @intCast(height),
-            .format = raylib.PixelFormat.uncompressed_r8g8b8a8,
-            .mipmaps = 1,
-        };
+        if (state != .waiting) {
+            if (try ollama.read_response(ollama_stream.reader(), &ollama_buffer, allocator)) |response| {
+                try prompt.writer().writeAll(response.value.response);
+                response.deinit();
 
-        raylib.beginDrawing();
-        raylib.clearBackground(raylib.Color.black);
-        raylib.drawTexture(try raylib.loadTextureFromImage(image), 0, 0, raylib.Color.white);
-        raylib.endDrawing();
-        pixels_mutex.unlock();
+                while (tok_i < prompt.items.len) {
+                    switch (state) {
+                        .thought => switch (prompt.items[tok_i]) {
+                            '<' => {
+                                state = .keyboard_start_tag;
+                            },
+                            else => {
+                                tok_i += 1;
+                                tok_start = tok_i;
+                            },
+                        },
+                        .keyboard_start_tag => {
+                            if (tok_i - tok_start == write_start.len) {
+                                tok_start = tok_i;
+                                state = .keyboard;
+                            } else if (prompt.items[tok_i] == write_start[tok_i - tok_start]) {
+                                tok_i += 1;
+                            } else {
+                                tok_i += 1;
+                                state = .thought;
+                            }
+                        },
+                        .keyboard_end_tag => {
+                            if (tok_i - tok_start == write_end.len) {
+                                tok_start = tok_i;
+                                state = .thought;
+                            } else if (prompt.items[tok_i] == write_end[tok_i - tok_start]) {
+                                tok_i += 1;
+                            } else {
+                                try written.append('<');
+                                try vnc.send_key_event(vnc_stream.writer(), true, '<');
+                                try vnc.send_key_event(vnc_stream.writer(), false, '<');
+
+                                tok_i = tok_start + 1;
+                                tok_start = tok_start;
+                                state = .keyboard;
+                            }
+                        },
+                        .keyboard => {
+                            switch (prompt.items[tok_i]) {
+                                '\\' => {
+                                    tok_i += 1;
+                                    state = .keyboard_backslash;
+                                },
+                                '<' => {
+                                    tok_i += 1;
+                                    state = .keyboard_end_tag;
+                                },
+                                else => |char| {
+                                    if (char < ' ' or char > '~') {
+                                        continue;
+                                    }
+
+                                    try written.append(char);
+                                    try vnc.send_key_event(vnc_stream.writer(), true, char);
+                                    try vnc.send_key_event(vnc_stream.writer(), false, char);
+
+                                    tok_i += 1;
+                                    tok_start = tok_i;
+                                },
+                            }
+                        },
+                        .keyboard_backslash => {
+                            // https://github.com/D-Programming-Deimos/libX11/blob/master/c/X11/keysymdef.h
+                            var key: u32 = undefined;
+                            key = switch (prompt.items[tok_i]) {
+                                'n' => 0xff0d,
+                                'b' => 0xff08,
+                                't' => 0xff09,
+                                else => unreachable,
+                            };
+
+                            try written.append('\\');
+                            try written.append(prompt.items[tok_i]);
+                            try vnc.send_key_event(vnc_stream.writer(), true, key);
+                            try vnc.send_key_event(vnc_stream.writer(), false, key);
+
+                            tok_i += 1;
+                            tok_start = tok_i;
+                            state = .keyboard;
+                        },
+                        else => unreachable,
+                    }
+                }
+            } else {
+                // Maybe we should keep outputing tokens?
+                state = .waiting;
+                wait_timer.reset();
+                // try prompt.writer().print("\n", .{});
+                // try prompt.writer().print("\n</bot>\n", .{});
+            }
+        }
+        try stdout.print("\x1b[2J\x1b[H{s}\n", .{prompt.items});
+        try stdout.print("\n{any}\n", .{state});
+        try stdout.print("\"{s}\"\n", .{written.items});
+        while (state == .waiting and wait_timer.read() <= wait_time) {
+            try stdout.print("\x1b[?25l{d}\r", .{(wait_time - wait_timer.read()) / 1_000_000_000});
+        }
     }
+    try stdout.print("\x1b[?25h", .{});
 }
 
-pub fn create_model(stream: *std.net.Stream, allocator: std.mem.Allocator, from: []const u8, template: []const u8) !void {
-    const body = try std.fmt.allocPrint(allocator,
-        \\{{
-        \\"model":"{s}",
-        \\"from":"{s}",
-        \\"system":"{s}",
-        \\"stream":false
-        \\}}
-    , .{ model_name, from, template });
-    defer allocator.free(body);
+// Try using a smarter ai
+// Custom tokens
+// Fine tuning
+// RL
 
-    const request = try std.fmt.allocPrint(allocator,
-        \\POST /api/create HTTP/1.1
-        \\Host: {s}
-        \\Content-Type: application/json
-        \\Content-Length: {d}
-        \\
-        \\{s}
-    , .{ ollama_host, body.len, body });
-    defer allocator.free(request);
+pub fn text_difference(prev: []u8, text: []u8) usize {
+    var diff_count: usize = 0;
+    for (0..@min(prev.len, text.len)) |i| {
+        const prev_c = prev[i];
+        const text_c = text[i];
 
-    try stream.writer().writeAll(request);
-
-    var buffer: [2048]u8 = undefined;
-    const n_read = try stream.reader().read(&buffer);
-    assert(std.mem.startsWith(u8, buffer[0..n_read], "HTTP/1.1 200 OK"));
-    assert(std.mem.endsWith(u8, buffer[0..n_read], "\"status\":\"success\"}"));
+        if (prev_c != text_c) {
+            const prev_c_printable = prev_c >= ' ' and prev_c <= '~';
+            const text_c_printable = text_c >= ' ' and text_c <= '~';
+            if (prev_c_printable and text_c_printable) {
+                diff_count += 1;
+            }
+        }
+    }
+    return diff_count + @max(prev.len, text.len) - @min(prev.len, text.len);
 }
 
-pub fn ollama_start_token_stream(stream: *std.net.Stream, allocator: std.mem.Allocator, buffer: []u8, prompt: []u8) !void {
-    const body = try std.fmt.allocPrint(allocator,
-        \\{{
-        \\"model":"{s}",
-        \\"prompt":"{s}",
-        \\"stream":true
-        \\}}
-    , .{ model_name, prompt });
-    defer allocator.free(body);
-
-    const request = try std.fmt.allocPrint(allocator,
-        \\POST /api/generate HTTP/1.1
-        \\Host: {s}
-        \\Content-Type: application/json
-        \\Content-Length: {d}
-        \\
-        \\{s}
-    , .{ ollama_host, body.len, body });
-    defer allocator.free(request);
-
-    try stream.writer().writeAll(request);
-    const n_read = try stream.reader().read(buffer);
-    assert(std.mem.startsWith(u8, buffer[0..n_read], "HTTP/1.1 200 OK"));
-}
-
-pub fn ollama_next_token(stream: *std.net.Stream, allocator: std.mem.Allocator, buffer: []u8) !?[]u8 {
-    const n_read = try stream.reader().read(buffer);
-    const i = "\r\n".len + std.mem.indexOf(u8, buffer[0..n_read], "\r\n").?;
-    const json_str = std.mem.trimRight(u8, buffer[i..n_read], "\n");
-
-    const Response = struct { response: []u8, done: bool };
-    const parsed = try std.json.parseFromSlice(Response, allocator, json_str, .{ .ignore_unknown_fields = true });
-
-    return if (parsed.value.done) null else parsed.value.response;
-}
-
-pub fn image_to_text_loop(pixels: []u8, pixels_mutex: *std.Thread.Mutex, width: usize, height: usize, bytes_per_pixel: usize, text: *?[*:0]u8, text_mutex: *std.Thread.Mutex) !void {
+pub fn image_to_text_loop(pixels: []u8, pixels_mutex: *std.Thread.Mutex, width: usize, height: usize, bytes_per_pixel: usize, text: *[]u8, text_mutex: *std.Thread.Mutex) !void {
     const api = c.TessBaseAPICreate();
     assert(api != null);
     defer c.TessBaseAPIDelete(api);
@@ -155,123 +242,23 @@ pub fn image_to_text_loop(pixels: []u8, pixels_mutex: *std.Thread.Mutex, width: 
         pixels_mutex.lock();
         c.TessBaseAPISetImage(api, pixels.ptr, @intCast(width), @intCast(height), @intCast(bytes_per_pixel), @intCast(bytes_per_pixel * width));
         pixels_mutex.unlock();
+
         text_mutex.lock();
         text.* = std.mem.span(c.TessBaseAPIGetUTF8Text(api));
         text_mutex.unlock();
     }
 }
 
-pub fn vnc_handshake(host: []const u8, port: u16, rfb_version: []const u8, sharing: bool) !struct { std.net.Stream, usize, usize, usize } {
-    const addr = try std.net.Address.parseIp(host, port);
-    var stream = try std.net.tcpConnectToAddress(addr);
-
-    var rfb_buffer = try stream.reader().readBytesNoEof(12);
-    assert(std.mem.eql(u8, &rfb_buffer, rfb_version));
-    try stream.writer().writeAll(rfb_version);
-
-    const number_of_security_types = try stream.reader().readInt(u8, Endian.little);
-    assert(number_of_security_types == 1);
-    try stream.writer().writeAll(&.{1});
-
-    const security_result = try stream.reader().readInt(u32, Endian.little);
-    assert(security_result == 1);
-    try stream.writer().writeAll(&.{if (sharing) 1 else 0});
-
-    const width: usize = @intCast(try stream.reader().readInt(u16, Endian.little));
-    const height: usize = @intCast(try stream.reader().readInt(u16, Endian.little));
-    const bits_per_pixel: usize = @intCast(try stream.reader().readByte());
-    try stream.reader().skipBytes(16, .{});
-    const name_length = try stream.reader().readInt(u32, Endian.big);
-    try stream.reader().skipBytes(name_length, .{});
-
-    return .{ stream, width, height, bits_per_pixel };
-}
-
 // Keeps sending framebuffer_update_requests and always keeps the pixels slice updated.
-pub fn screen_loop(stream: *std.net.Stream, pixels: []u8, pixels_mutex: *std.Thread.Mutex, width: usize, height: usize, bytes_per_pixel: usize) !void {
-    try send_framebuffer_update_request(stream, width, height, false);
+pub fn screen_loop(stream: std.net.Stream, pixels: []u8, pixels_mutex: *std.Thread.Mutex, width: usize, height: usize, bytes_per_pixel: usize) !void {
+    try vnc.send_framebuffer_update_request(stream.writer(), width, height, false);
     while (true) {
         switch (try stream.reader().readByte()) {
             0 => {
-                try send_framebuffer_update_request(stream, width, height, false); // Try using incremental = true
-                try read_framebuffer_update(stream, pixels, pixels_mutex, width, bytes_per_pixel);
+                try vnc.send_framebuffer_update_request(stream.writer(), width, height, true); // incremental might cause worse performance.
+                try vnc.read_framebuffer_update(stream.reader(), pixels, pixels_mutex, width, bytes_per_pixel);
             },
             else => unreachable,
         }
     }
-}
-
-pub fn send_framebuffer_update_request(stream: *std.net.Stream, width: usize, height: usize, incremental: bool) !void {
-    try stream.writer().writeByte(3);
-    try stream.writer().writeByte(if (incremental) 1 else 0);
-    try stream.writer().writeInt(u16, 0, Endian.big);
-    try stream.writer().writeInt(u16, 0, Endian.big);
-    try stream.writer().writeInt(u16, @intCast(width), Endian.big);
-    try stream.writer().writeInt(u16, @intCast(height), Endian.big);
-}
-
-pub fn read_framebuffer_update(stream: *std.net.Stream, pixels: []u8, pixels_mutex: *std.Thread.Mutex, width: usize, bytes_per_pixel: usize) !void {
-    assert(try stream.reader().readByte() == 0); // padding
-
-    pixels_mutex.lock();
-    for (0..try stream.reader().readInt(u16, Endian.big)) |_| {
-        const x: usize = @intCast(try stream.reader().readInt(u16, Endian.big));
-        const y: usize = @intCast(try stream.reader().readInt(u16, Endian.big));
-        const w: usize = @intCast(try stream.reader().readInt(u16, Endian.big));
-        const h: usize = @intCast(try stream.reader().readInt(u16, Endian.big));
-        assert(try stream.reader().readInt(i32, Endian.big) == 0); // encoding
-
-        for (0..h) |y_| {
-            const i = (x + (y + y_) * width) * bytes_per_pixel;
-            try stream.reader().readNoEof(pixels[i .. i + w * bytes_per_pixel]);
-        }
-
-        // Remove transparency
-        for (x..x + w) |x_| {
-            for (y..y + h) |y_| {
-                pixels[(x_ + y_ * width) * bytes_per_pixel + 3] = 0xFF;
-            }
-        }
-    }
-    pixels_mutex.unlock();
-}
-
-// https://github.com/D-Programming-Deimos/libX11/blob/master/c/X11/keysymdef.h
-const tab = 0xff09;
-const enter = 0xff0d;
-const backspace = 0xff08;
-pub fn write_string(stream: *std.net.Stream, text: []const u8) ![]const u8 {
-    var i: usize = 0;
-    while (i < text.len) : (i += 1) {
-        var code: u32 = undefined;
-        switch (text[i]) {
-            '\\' => {
-                if (i >= text.len - 1) {
-                    break;
-                }
-
-                i += 1;
-                switch (text[i]) {
-                    '\\' => code = '\\',
-                    'n' => code = enter,
-                    't' => code = tab,
-                    'b' => code = backspace,
-                    else => unreachable,
-                }
-            },
-            ' '...'\\' - 1, '\\' + 1...'~' => code = text[i],
-            else => unreachable,
-        }
-
-        try send_key_event(stream, true, code);
-        try send_key_event(stream, false, code);
-    }
-    return text[i..];
-}
-
-pub fn send_key_event(stream: *std.net.Stream, down: bool, key: u32) !void {
-    try stream.writer().writeByte(4);
-    try stream.writer().writeByte(if (down) 1 else 0);
-    try stream.writer().writeInt(u16, 0, Endian.big);
-    try stream.writer().writeInt(u32, key, Endian.big);
 }

@@ -23,17 +23,9 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        .zigimg = .{
-            .url = "https://github.com/zigimg/zigimg/archive/bbf48e7.tar.gz",
-            .hash = "1220234151ce3dfb0ae960956aa7ea0cf898020d3f1fb2235b85a5cff7cd3a4c8452",
-        },
         .@"raylib-zig" = .{
-            .url = "git+https://github.com/Not-Nik/raylib-zig?ref=devel#58724227e7fd90bebfcbd44c6013231447a67ff2",
-            .hash = "1220eedbc450fcfced1599d69f1e2c38b60af51616dbf724f6b9a8ed2c2a7c62cf9c",
-        },
-        .@"ollama-zig" = .{
-            .url = "git+https://github.com/dravenk/ollama-zig.git#7cb0deaa743156dd6e27ee7b36908778bc39dd91",
-            .hash = "1220d4dd376a2d9ed644201363f39bd165e873a60dcf1d45e2fa3e4714142eae57c0",
+            .url = "git+https://github.com/Not-Nik/raylib-zig?ref=devel#5004bb2316fc34a416644f3910c8c79dd08d7c63",
+            .hash = "1220223e9881fc9510eeb30fc2ee73fb49ee645bf1859cc46a92b649d35ecfd3351a",
         },
     },
     .paths = .{
